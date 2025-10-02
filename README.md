@@ -1,6 +1,6 @@
 # PCAP Gap Detector
 
-Detects timestamp gaps in PCAP files using parallel processing.
+Detects timestamp gaps in PCAP files.
 
 ## Requirements
 
@@ -22,8 +22,6 @@ python pcap_gap_detector.py --pcap <file> --seconds <threshold>
 ```
 --pcap <file>           PCAP file to analyze (required)
 --seconds <threshold>   Gap threshold in seconds (required)
---batchsize <size>      Packets per batch (default: 100000)
---workers <count>       Number of parallel workers (default: CPU count)
 --csv <output.csv>      Export gaps to CSV file
 --no-color              Disable colored output
 ```
@@ -40,17 +38,11 @@ Export to CSV:
 python pcap_gap_detector.py --pcap capture.pcap --seconds 5 --csv gaps.csv
 ```
 
-Large file with custom settings:
-```bash
-python pcap_gap_detector.py --pcap large.pcap --seconds 10 --batchsize 200000 --workers 8
-```
-
 ## How It Works
 
 1. Reads PCAP file in batches
-2. Processes batches in parallel across multiple CPU cores
-3. Detects gaps between packet timestamps that exceed the threshold
-4. Reports gaps with packet numbers and timestamps
+2. Detects gaps between packet timestamps that exceed the threshold
+3. Reports gaps with packet numbers and timestamps
 
 ## CSV Output
 
@@ -63,10 +55,6 @@ When using `--csv`, exports the following columns:
 - timestamp_end_utc
 - gap_seconds
 - gap_duration
-
-## Attribution
-
-Original script enhanced with progress tracking, CSV export, and improved output formatting by Claude (Anthropic AI) in October 2025. Core multiprocessing algorithm preserved from original.
 
 ## License
 BSD 3-Clause License
