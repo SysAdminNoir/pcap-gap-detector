@@ -1,33 +1,18 @@
 #!/usr/bin/env python3
 """
-PCAP Gap Detector - Enhanced Version
-=====================================
-Original script: User-provided PCAP gap detector using Scapy
-Enhanced by: Claude (Anthropic AI Assistant) - October 2025
-
-Changes Made:
-- Added real-time progress tracking during packet reading (~15% new code)
-- Implemented color-coded output with formatting (~20% new code)
-- Added gap categorization and summary statistics (~15% new code)
-- Enhanced error handling and user interruption support (~5% new code)
-- Improved output structure with sections and visual hierarchy (~10% new code)
-- Added human-readable duration formatting (~5% new code)
-- Restructured gap data as dictionaries for better processing (~10% new code)
-- Added command-line help improvements and examples (~5% new code)
-- Added file size display and processing rate statistics (~5% new code)
-
-Estimated Changes: ~40% enhanced/new code, ~60% original functionality preserved
-Core Algorithm: Original multiprocessing batch approach maintained
+PCAP Gap Detector - Single-threaded Version
+============================================
+Simplified version without multiprocessing overhead.
+Should be faster for most use cases since PCAP reading is the bottleneck.
 """
 
 import argparse
 import os
 import sys
 import time
-from multiprocessing import Pool, cpu_count
-from scapy.utils import RawPcapReader
-from datetime import datetime, timedelta
 from collections import defaultdict
+
+from scapy.utils import RawPcapReader
 
 
 # ANSI color codes for better output
@@ -40,7 +25,6 @@ class Colors:
     FAIL = '\033[91m'
     ENDC = '\033[0m'
     BOLD = '\033[1m'
-    UNDERLINE = '\033[4m'
 
 
 def printable_timestamp(ts, resol):
@@ -62,158 +46,107 @@ def format_duration(seconds):
         return f'{seconds / 86400:.1f}d'
 
 
-def process_batch(batch_data):
-    batch, diffsecs, start_pkt_num = batch_data
-    output = []
-    prev_timestamp, prev_tsres = batch[0]
-    pkt_num = start_pkt_num
+class ProfileTimer:
+    """Context manager for timing code sections"""
 
-    for (timestamp, tsres) in batch[1:]:
-        pkt_num += 1
-        difference = (timestamp / tsres) - (prev_timestamp / prev_tsres)
-        if difference > diffsecs:
-            output.append({
-                'start': (prev_timestamp, prev_tsres),
-                'end': (timestamp, tsres),
-                'gap': difference,
-                'start_pkt': pkt_num - 1,
-                'end_pkt': pkt_num
-            })
-        prev_timestamp, prev_tsres = timestamp, tsres
+    def __init__(self, name, enabled=True):
+        self.name = name
+        self.enabled = enabled
+        self.elapsed = 0
 
-    return {
-        "gaps": output,
-        "first": batch[0],
-        "last": batch[-1],
-        "count": len(batch)
-    }
+    def __enter__(self):
+        if self.enabled:
+            self.start = time.time()
+        return self
+
+    def __exit__(self, *args):
+        if self.enabled:
+            self.elapsed = time.time() - self.start
+            print(f'{Colors.OKCYAN}  [{self.name}]{Colors.ENDC} {self.elapsed:.2f}s')
 
 
-def batch_generator(file_name, batch_size):
-    batch = []
-    total_packets = 0
-
-    for (_, pkt_metadata) in RawPcapReader(file_name):
-        tsres = pkt_metadata.tsresol
-        timestamp = (pkt_metadata.tshigh << 32) | pkt_metadata.tslow
-        batch.append((timestamp, tsres))
-        total_packets += 1
-
-        if len(batch) >= batch_size:
-            yield batch, total_packets
-            batch = []
-
-    if batch:
-        yield batch, total_packets
-
-
-def process_pcap_parallel(file_name, diffsecs, batch_size=100000, num_workers=None, csv_output=None):
+def process_pcap(file_name, diffsecs, csv_output=None, profile=False):
     start_time = time.time()
+    timing_data = {}
 
     print(f'{Colors.HEADER}{Colors.BOLD}═══════════════════════════════════════════════════════════════{Colors.ENDC}')
-    print(f'{Colors.HEADER}{Colors.BOLD}  PCAP Gap Detector{Colors.ENDC}')
+    print(f'{Colors.HEADER}{Colors.BOLD}  PCAP Gap Detector (Single-threaded){Colors.ENDC}')
     print(f'{Colors.HEADER}{Colors.BOLD}═══════════════════════════════════════════════════════════════{Colors.ENDC}\n')
 
     print(f'{Colors.OKCYAN}File:{Colors.ENDC} {file_name}')
     file_size = os.path.getsize(file_name)
     print(f'{Colors.OKCYAN}Size:{Colors.ENDC} {file_size / (1024 ** 3):.2f} GB')
     print(f'{Colors.OKCYAN}Gap threshold:{Colors.ENDC} {diffsecs} seconds')
-    print(f'{Colors.OKCYAN}Batch size:{Colors.ENDC} {batch_size:,} packets')
-
-    num_workers = num_workers or cpu_count()
-    print(f'{Colors.OKCYAN}Workers:{Colors.ENDC} {num_workers}')
     if csv_output:
         print(f'{Colors.OKCYAN}CSV Export:{Colors.ENDC} {csv_output}')
+    if profile:
+        print(f'{Colors.OKCYAN}Profiling:{Colors.ENDC} Enabled')
     print()
 
-    pool = Pool(processes=num_workers)
-    jobs = []
-    total_records = 0
-    batch_count = 0
-    current_pkt_num = 0
-
-    print(f'{Colors.OKBLUE}Phase 1: Reading and processing batches...{Colors.ENDC}')
-
-    # Read and submit all batches
-    for batch, pkt_count in batch_generator(file_name, batch_size):
-        if len(batch) < 2:
-            continue
-
-        jobs.append(pool.apply_async(process_batch, ((batch, diffsecs, current_pkt_num),)))
-        current_pkt_num += len(batch)
-        total_records = pkt_count
-        batch_count += 1
-
-        # Progress indicator
-        print(f'\r  Packets read: {total_records:,} | Batches: {batch_count}', end='', flush=True)
-
-    print()  # New line after progress
-
-    pool.close()
-
-    print(f'{Colors.OKBLUE}Phase 2: Collecting results...{Colors.ENDC}')
-    pool.join()
-
-    # Gather results
-    results = [job.get() for job in jobs]
-
-    # Collect all gaps
     all_gaps = []
+    total_packets = 0
+    prev_timestamp = None
+    prev_tsres = None
 
-    print(f'{Colors.OKBLUE}Phase 3: Analyzing gaps...{Colors.ENDC}')
+    print(f'{Colors.OKBLUE}Processing PCAP file...{Colors.ENDC}')
 
-    # Gaps within batches
-    for res in results:
-        all_gaps.extend(res["gaps"])
+    with ProfileTimer("PCAP reading and gap detection", profile) as t1:
+        for (_, pkt_metadata) in RawPcapReader(file_name):
+            total_packets += 1  # Increment first so we start at 1
+            tsres = pkt_metadata.tsresol
+            timestamp = (pkt_metadata.tshigh << 32) | pkt_metadata.tslow
 
-    # Check boundaries between batches (need to track packet numbers)
-    batch_pkt_offset = 0
-    for i in range(1, len(results)):
-        batch_pkt_offset += results[i - 1]["count"]
+            if prev_timestamp is not None:
+                difference = (timestamp / tsres) - (prev_timestamp / prev_tsres)
+                if difference > diffsecs:
+                    all_gaps.append({
+                        'start': (prev_timestamp, prev_tsres),
+                        'end': (timestamp, tsres),
+                        'gap': difference,
+                        'start_pkt': total_packets - 1,
+                        'end_pkt': total_packets
+                    })
 
-        prev_last, prev_tsres = results[i - 1]["last"]
-        curr_first, curr_tsres = results[i]["first"]
-        difference = (curr_first / curr_tsres) - (prev_last / prev_tsres)
+            prev_timestamp = timestamp
+            prev_tsres = tsres
 
-        if difference > diffsecs:
-            all_gaps.append({
-                'start': (prev_last, prev_tsres),
-                'end': (curr_first, curr_tsres),
-                'gap': difference,
-                'start_pkt': batch_pkt_offset,
-                'end_pkt': batch_pkt_offset + 1
-            })
+            # Progress indicator every 100k packets
+            if not profile and total_packets % 100000 == 0:
+                print(f'\r  Packets processed: {total_packets:,}', end='', flush=True)
 
-    # Sort gaps by packet number for CSV (chronological)
-    all_gaps.sort(key=lambda x: x['start_pkt'])
+        if not profile:
+            print(f'\r  Packets processed: {total_packets:,}')
+        timing_data['processing'] = t1.elapsed if profile else 0
 
     # Export to CSV if requested
     if csv_output and all_gaps:
-        print(f'{Colors.OKBLUE}Phase 4: Exporting to CSV...{Colors.ENDC}')
-        import csv
-        try:
-            with open(csv_output, 'w', newline='') as csvfile:
-                fieldnames = ['gap_number', 'packet_start', 'packet_end', 'timestamp_start_utc',
-                              'timestamp_end_utc', 'gap_seconds', 'gap_duration']
-                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                writer.writeheader()
+        print(f'{Colors.OKBLUE}Exporting to CSV...{Colors.ENDC}')
+        with ProfileTimer("CSV export", profile) as t2:
+            import csv
+            try:
+                with open(csv_output, 'w', newline='') as csvfile:
+                    fieldnames = ['gap_number', 'packet_start', 'packet_end', 'timestamp_start_utc',
+                                  'timestamp_end_utc', 'gap_seconds', 'gap_duration']
+                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                    writer.writeheader()
 
-                for idx, gap in enumerate(all_gaps, 1):
-                    start_ts, start_res = gap['start']
-                    end_ts, end_res = gap['end']
+                    for idx, gap in enumerate(all_gaps, 1):
+                        start_ts, start_res = gap['start']
+                        end_ts, end_res = gap['end']
 
-                    writer.writerow({
-                        'gap_number': idx,
-                        'packet_start': gap['start_pkt'],
-                        'packet_end': gap['end_pkt'],
-                        'timestamp_start_utc': printable_timestamp(start_ts, start_res),
-                        'timestamp_end_utc': printable_timestamp(end_ts, end_res),
-                        'gap_seconds': f'{gap["gap"]:.6f}',
-                        'gap_duration': format_duration(gap['gap'])
-                    })
-            print(f'{Colors.OKGREEN}  ✓ CSV exported successfully to {csv_output}{Colors.ENDC}')
-        except Exception as e:
-            print(f'{Colors.FAIL}  ✗ Failed to export CSV: {e}{Colors.ENDC}')
+                        writer.writerow({
+                            'gap_number': idx,
+                            'packet_start': gap['start_pkt'],
+                            'packet_end': gap['end_pkt'],
+                            'timestamp_start_utc': printable_timestamp(start_ts, start_res),
+                            'timestamp_end_utc': printable_timestamp(end_ts, end_res),
+                            'gap_seconds': f'{gap["gap"]:.6f}',
+                            'gap_duration': format_duration(gap['gap'])
+                        })
+                print(f'{Colors.OKGREEN}CSV exported successfully to {csv_output}{Colors.ENDC}')
+            except Exception as e:
+                print(f'{Colors.FAIL}Failed to export CSV: {e}{Colors.ENDC}')
+            timing_data['csv_export'] = t2.elapsed if profile else 0
 
     # Sort gaps by size for display
     all_gaps_by_size = sorted(all_gaps, key=lambda x: x['gap'], reverse=True)
@@ -260,47 +193,60 @@ def process_pcap_parallel(file_name, diffsecs, batch_size=100000, num_workers=No
             color = Colors.FAIL if gap['gap'] > 3600 else Colors.WARNING
 
             print(f'{color}Gap #{idx}:{Colors.ENDC}')
-            print(f'  Packets: {gap["start_pkt"]} → {gap["end_pkt"]}')
+            print(f'  Packets: {gap["start_pkt"]} -> {gap["end_pkt"]}')
             print(f'  From: {start_str} UTC')
             print(f'  To:   {end_str} UTC')
             print(f'  Duration: {gap_str} ({gap["gap"]:.2f} seconds)')
             print()
     else:
-        print(f'{Colors.OKGREEN}✓ No gaps found exceeding {diffsecs}s threshold{Colors.ENDC}\n')
+        print(f'{Colors.OKGREEN}No gaps found exceeding {diffsecs}s threshold{Colors.ENDC}\n')
 
     # Summary statistics
     elapsed = time.time() - start_time
     print(f'{Colors.HEADER}{Colors.BOLD}═══════════════════════════════════════════════════════════════{Colors.ENDC}')
     print(f'{Colors.HEADER}{Colors.BOLD}  STATISTICS{Colors.ENDC}')
     print(f'{Colors.HEADER}{Colors.BOLD}═══════════════════════════════════════════════════════════════{Colors.ENDC}\n')
-    print(f'{Colors.OKGREEN}Total packets processed:{Colors.ENDC} {total_records:,}')
+    print(f'{Colors.OKGREEN}Total packets processed:{Colors.ENDC} {total_packets:,}')
     print(f'{Colors.OKGREEN}Processing time:{Colors.ENDC} {elapsed:.2f} seconds')
-    print(f'{Colors.OKGREEN}Processing rate:{Colors.ENDC} {total_records / elapsed:,.0f} packets/second')
+    print(f'{Colors.OKGREEN}Processing rate:{Colors.ENDC} {total_packets / elapsed:,.0f} packets/second')
+
+    # Show profiling breakdown if enabled
+    if profile and timing_data:
+        print()
+        print(f'{Colors.BOLD}Performance Breakdown:{Colors.ENDC}')
+        total_accounted = sum(timing_data.values())
+        for name, duration in timing_data.items():
+            percentage = (duration / elapsed * 100) if elapsed > 0 else 0
+            print(f'  {name:.<30} {duration:>6.2f}s ({percentage:>5.1f}%)')
+
+        if total_accounted < elapsed:
+            overhead = elapsed - total_accounted
+            overhead_pct = (overhead / elapsed * 100) if elapsed > 0 else 0
+            print(f'  {"other/overhead":.<30} {overhead:>6.2f}s ({overhead_pct:>5.1f}%)')
+
     print()
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='PCAP Timestamp Gap Detector with Enhanced Progress Tracking',
+        description='PCAP Timestamp Gap Detector (Single-threaded)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 Examples:
   python script.py --pcap capture.pcap --seconds 5
-  python script.py --pcap large.pcap --seconds 10 --batchsize 200000 --workers 8
+  python script.py --pcap large.pcap --seconds 10 --csv gaps.csv --profile
         '''
     )
     parser.add_argument('--pcap', metavar='<pcap file name>', required=True,
                         help='Path to PCAP file')
     parser.add_argument('--seconds', metavar='<seconds>', required=True, type=float,
                         help='Gap threshold in seconds')
-    parser.add_argument('--batchsize', metavar='<size>', type=int, default=100000,
-                        help='Packets per batch (default: 100000)')
-    parser.add_argument('--workers', metavar='<count>', type=int, default=None,
-                        help='Number of parallel workers (default: CPU count)')
     parser.add_argument('--no-color', action='store_true',
                         help='Disable colored output')
     parser.add_argument('--csv', metavar='<output.csv>', dest='csv_output',
-                        help='Export gaps to CSV file (sortable by packet number or timestamp)')
+                        help='Export gaps to CSV file')
+    parser.add_argument('--profile', action='store_true',
+                        help='Enable performance profiling to show time breakdown')
 
     args = parser.parse_args()
 
@@ -315,7 +261,7 @@ Examples:
         sys.exit(1)
 
     try:
-        process_pcap_parallel(args.pcap, args.seconds, args.batchsize, args.workers, args.csv_output)
+        process_pcap(args.pcap, args.seconds, args.csv_output, args.profile)
     except KeyboardInterrupt:
         print(f'\n{Colors.WARNING}Interrupted by user{Colors.ENDC}')
         sys.exit(130)
